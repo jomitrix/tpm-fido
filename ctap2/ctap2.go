@@ -81,38 +81,18 @@ type getInfoResponse struct {
 // EncodeGetInfoResponse builds the authenticatorGetInfo CBOR response body.
 // rk:true + up:true advertise resident-key and user-presence support so
 // GitHub and other RPs that require rk will accept this authenticator.
-// clientPin reflects whether a PIN has actually been set (CTAP2 clients,
-// notably libfido2, gate credential-management access on this being true,
-// so it must track real PIN state rather than being hardcoded).
-//
-// The "uv" option (built-in user verification, a la Windows Hello / Touch
-// ID) is gated on internalUV. Per CTAP2 spec, uv:true means the authenticator
-// can verify the user on its *own* side without the platform sending a
-// pinUvAuthParam derived from a browser-collected PIN. When internalUV is on
-// (and a PIN exists to back it) we advertise uv:true + pinUvAuthToken +
-// FIDO_2_1, and browsers drive getPinUvAuthTokenUsingUvWithPermissions so we
-// collect the PIN in our own system dialog -- no browser PIN box. When it's
-// off we behave as a plain clientPIN authenticator (the browser collects the
-// PIN). Advertising uv:true is only safe alongside the getUvToken/
-// getUVRetries handlers; historically advertising it *without* them made
-// Chrome loop on MakeCredential forever, always failing PIN_REQUIRED.
-func EncodeGetInfoResponse(clientPinSet, internalUV bool) ([]byte, error) {
-	// Internal UV needs a PIN to actually verify against, so only light it up
-	// when a PIN is set.
-	helloMode := internalUV && clientPinSet
-
-	versions := []string{"U2F_V2", "FIDO_2_0"}
+// Built-in PAM user verification (uv:true + pinUvAuthToken + FIDO_2_1) is
+// permanently enabled.
+func EncodeGetInfoResponse() ([]byte, error) {
+	versions := []string{"U2F_V2", "FIDO_2_0", "FIDO_2_1"}
 	options := map[string]bool{
-		"rk":        true,
-		"up":        true,
-		"plat":      false,
-		"clientPin": clientPinSet,
-		"credMgmt":  true,
-	}
-	if helloMode {
-		versions = append(versions, "FIDO_2_1")
-		options["uv"] = true
-		options["pinUvAuthToken"] = true
+		"rk":              true,
+		"up":              true,
+		"plat":            false,
+		"clientPin":       false,
+		"credMgmt":        true,
+		"uv":              true,
+		"pinUvAuthToken":  true,
 	}
 
 	resp := getInfoResponse{

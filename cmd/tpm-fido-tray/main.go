@@ -1,130 +1,111 @@
-// Command tpm-fido-tray is a system tray icon for managing a running
-// tpm-fido daemon: view/delete resident credentials per site, and
-// set/change the CTAP2 PIN, via a GTK3 window opened from the tray menu.
-// It talks to the daemon over the local control socket (see the ctlsocket
-// package) -- it never touches the TPM, HID device, or on-disk stores
-// directly.
+// Command tpm-fido-tray is a system tray icon for tpm-fido.
+// It provides a tray menu with "Open Passkey Manager" and "Quit".
+// Clicking "Open Passkey Manager" launches tpm-fido-manager (or
+// tpm-fido-manager.py) without blocking the tray process.
 package main
 
 import (
 	_ "embed"
-	"encoding/json"
-	"fmt"
 	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
 
 	"github.com/getlantern/systray"
-	"github.com/gotk3/gotk3/glib"
-	"github.com/gotk3/gotk3/gtk"
-	"github.com/psanford/tpm-fido/ctlsocket"
 )
 
 //go:embed icon/icon.png
 var iconPNG []byte
 
 func main() {
+	if os.Getenv("TMPDIR") == "" {
+		if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+			_ = os.Setenv("TMPDIR", runtimeDir)
+		}
+	}
 	systray.Run(onTrayReady, onTrayExit)
 }
 
 func onTrayReady() {
 	systray.SetIcon(iconPNG)
 	systray.SetTitle("tpm-fido")
-	systray.SetTooltip("tpm-fido: manage PIN and credentials")
+	systray.SetTooltip("tpm-fido: hardware-bound passkey authenticator")
 
-	openItem := systray.AddMenuItem("Open tpm-fido Manager", "View PIN status, Windows Hello mode, and credentials")
+	openItem := systray.AddMenuItem("Open Passkey Manager", "Manage resident credentials")
 	systray.AddSeparator()
 	quitItem := systray.AddMenuItem("Quit", "Quit tpm-fido-tray")
-
-	// GTK owns its own event loop (gtk.Main) once initialized, but that
-	// only needs to happen on some goroutine -- unlike systray, which
-	// locks the actual process main thread on init, gotk3's GTK binding
-	// doesn't require being on that specific thread, only being
-	// self-consistent about which thread it runs its own loop on. Doing
-	// GTK setup lazily here (rather than in main) keeps the tray icon
-	// responsive even before the window is ever opened.
-	go runGTK(openItem, quitItem)
-}
-
-func onTrayExit() {}
-
-func runGTK(openItem, quitItem *systray.MenuItem) {
-	gtk.Init(nil)
-
-	win, err := gtk.WindowNew(gtk.WINDOW_TOPLEVEL)
-	if err != nil {
-		log.Fatalf("create window: %s", err)
-	}
-	win.SetTitle("tpm-fido")
-	win.SetDefaultSize(480, 420)
-	// Closing the window (the 'x' button) hides it rather than exiting
-	// the process -- the tray icon and daemon connection stay alive, same
-	// as any other tray-managed app. Quit is only reachable via the tray
-	// menu's explicit Quit item.
-	win.Connect("delete-event", func() bool {
-		win.Hide()
-		return true
-	})
-
-	app := newApp(win)
-	win.Add(app.root)
 
 	go func() {
 		for {
 			select {
 			case <-openItem.ClickedCh:
-				glib.IdleAdd(func() {
-					if err := app.refresh(); err != nil {
-						app.showError(fmt.Sprintf("Could not connect to tpm-fido: %s\n\nIs the tpm-fido service running?", err))
-					}
-					win.ShowAll()
-					win.Present()
-				})
+				launchManager()
 			case <-quitItem.ClickedCh:
 				systray.Quit()
-				glib.IdleAdd(gtk.MainQuit)
 				return
 			}
 		}
 	}()
-
-	gtk.Main()
 }
 
-// call is a thin wrapper around ctlsocket.Call using the default socket
-// path, with the result type parameter decoded via the caller.
-func call(method string, params interface{}) (*ctlsocket.Response, error) {
-	resp, err := ctlsocket.Call("", method, params)
+func onTrayExit() {}
+
+// launchManager starts tpm-fido-manager as a detached child process.
+// It searches the same candidates that pamverifier uses for the prompt.
+func launchManager() {
+	managerPath, err := findManager()
 	if err != nil {
-		return nil, err
+		log.Printf("tpm-fido-tray: manager not found: %s", err)
+		return
 	}
-	return resp, nil
+
+	var cmd *exec.Cmd
+	if filepath.Ext(managerPath) == ".py" {
+		cmd = exec.Command("python3", managerPath)
+	} else {
+		cmd = exec.Command(managerPath)
+	}
+	cmd.Env = os.Environ()
+	// Detach so the tray keeps running even if manager is closed.
+	if err := cmd.Start(); err != nil {
+		log.Printf("tpm-fido-tray: failed to launch manager: %s", err)
+		return
+	}
+	// Reap async so it doesn't become a zombie.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cmd.Wait()
+	}()
 }
 
-// getInternalUV reads the daemon's persisted "Windows Hello mode" toggle.
-func getInternalUV() (bool, error) {
-	resp, err := call("GetInternalUV", nil)
-	if err != nil {
-		return false, err
+func findManager() (string, error) {
+	if envPath := os.Getenv("TPM_FIDO_MANAGER"); envPath != "" {
+		if _, err := os.Stat(envPath); err == nil {
+			return envPath, nil
+		}
 	}
-	var r struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := json.Unmarshal(resp.Result, &r); err != nil {
-		return false, err
-	}
-	return r.Enabled, nil
-}
 
-// setInternalUV writes the toggle and returns the value the daemon stored.
-func setInternalUV(enabled bool) (bool, error) {
-	resp, err := call("SetInternalUV", map[string]bool{"enabled": enabled})
-	if err != nil {
-		return false, err
+	if p, err := exec.LookPath("tpm-fido-manager"); err == nil {
+		return p, nil
 	}
-	var r struct {
-		Enabled bool `json:"enabled"`
+
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range []string{"tpm-fido-manager", "cmd/tpm-fido-manager/tpm-fido-manager.py"} {
+			p := filepath.Join(dir, name)
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
 	}
-	if err := json.Unmarshal(resp.Result, &r); err != nil {
-		return false, err
+
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".local", "bin", "tpm-fido-manager")
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
 	}
-	return r.Enabled, nil
+
+	return "", os.ErrNotExist
 }

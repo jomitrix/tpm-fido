@@ -9,9 +9,11 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"log"
 	"math/big"
-	"os/exec"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,45 +22,61 @@ import (
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/memory"
-	"github.com/psanford/tpm-fido/pinentry"
 	"github.com/psanford/tpm-fido/pinprotocol"
-	"github.com/psanford/tpm-fido/pinstore"
 	"github.com/psanford/tpm-fido/residentstore"
 	"github.com/psanford/tpm-fido/sitesignatures"
 	"github.com/psanford/tpm-fido/statuscode"
 	"github.com/psanford/tpm-fido/tpm"
-	"github.com/psanford/tpm-fido/uvconfig"
 	"github.com/psanford/tpm-fido/uvmethod"
-	"github.com/psanford/tpm-fido/uvmethod/pinverifier"
+	"github.com/psanford/tpm-fido/uvmethod/pamverifier"
 )
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
 var residentStorePath = flag.String("resident-store", "", "path to resident (discoverable) credential metadata store; defaults to $XDG_CONFIG_HOME/tpm-fido/resident-credentials.json")
-var pinStorePath = flag.String("pin-store", "", "path to PIN hash/retry-counter store; defaults to $XDG_CONFIG_HOME/tpm-fido/pin-state.json")
-var ctlSocketPath = flag.String("ctl-socket", "", "path to the local control-socket used by companion tools (e.g. a tray app); defaults to $XDG_RUNTIME_DIR/tpm-fido.sock")
-var uvConfigPath = flag.String("uv-config", "", "path to the user-toggle store (internal-UV/Hello mode); defaults to $XDG_CONFIG_HOME/tpm-fido/uv-config.json")
-var noTray = flag.Bool("no-tray", false, "don't launch the tpm-fido-tray companion UI (it's launched by default once tpm-fido-tray is found on PATH)")
+var promptPath = flag.String("prompt-cmd", "", "path to tpm-fido-prompt helper (defaults to PATH, cmd/tpm-fido-prompt/tpm-fido-prompt.py, or ~/.local/bin/tpm-fido-prompt)")
+var ctlSocketPath = flag.String("ctl-socket", "", "path to the local control-socket used by companion tools (e.g. a manager app); defaults to $XDG_RUNTIME_DIR/tpm-fido.sock")
+var noTray = flag.Bool("no-tray", false, "don't launch the tpm-fido manager/tray companion UI (it's launched by default once found on PATH)")
+var pcrBinding = flag.String("pcr-binding", "0,2,7", "comma-separated list of PCR indices to seal passkey signing keys to (e.g. '0,2,7'; set to 'none' or '' to disable)")
+
+func parsePCRList(s string) []int {
+	if s == "" || strings.EqualFold(s, "none") || strings.EqualFold(s, "off") || strings.EqualFold(s, "disabled") {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var pcrs []int
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		var val int
+		if _, err := fmt.Sscanf(p, "%d", &val); err == nil && val >= 0 && val <= 23 {
+			pcrs = append(pcrs, val)
+		}
+	}
+	return pcrs
+}
 
 func main() {
 	flag.Parse()
+	lock, err := acquireSingleInstanceLock()
+	if err != nil {
+		log.Println("tpm-fido daemon is already running. Exiting.")
+		return
+	}
+	defer lock.Close()
+
+	ensureSystemdUserService()
 	s := newServer()
 	s.run()
 }
 
 type server struct {
-	pe       *pinentry.Pinentry
 	signer   Signer
 	resident *residentstore.Store
-	pins     *pinstore.Store
 
-	// uvcfg holds user toggles, notably internal-UV ("Hello mode"). Read on
-	// every getInfo so the tray can flip it live.
-	uvcfg *uvconfig.Store
-
-	// uvVerifier performs built-in user verification for the CTAP 2.1
-	// internal-UV (getUvToken) path. PIN-backed today; the interface lets a
-	// biometric backend replace it later without touching the CTAP2 layer.
+	// uvVerifier performs built-in user verification via PAM modal.
 	uvVerifier uvmethod.Verifier
 
 	// credMgmtCursor holds pagination state for the CTAP2 credential
@@ -87,12 +105,7 @@ type server struct {
 	cborRateLimit *rateLimiter
 
 	// pinToken is the current pinUvAuthToken, minted fresh on each
-	// successful getPINToken exchange and required (as a valid HMAC key
-	// over the request) for privileged operations. Cleared to nil on
-	// process start; a real PIN entry is required after every restart.
-	// Guarded by pinTokenMu since it's read/written from both the main
-	// CTAP2/HID loop goroutine and the ctlsocket connection goroutines
-	// (ChangePIN invalidates it from the latter).
+	// successful UV verification exchange.
 	pinTokenMu sync.Mutex
 	pinToken   []byte
 }
@@ -124,11 +137,24 @@ type Signer interface {
 
 func newServer() *server {
 	s := server{
-		pe:            pinentry.New(),
 		cborRateLimit: newRateLimiter(50 * time.Millisecond),
 	}
 	if *backend == "tpm" {
-		signer, err := tpm.New(*device)
+		pcrVal := *pcrBinding
+		if envPCR := os.Getenv("TPM_FIDO_PCRS"); envPCR != "" {
+			pcrVal = envPCR
+		}
+		pcrs := parsePCRList(pcrVal)
+
+		var opts []tpm.Option
+		if len(pcrs) > 0 {
+			opts = append(opts, tpm.WithPCRs(pcrs))
+			log.Printf("tpm: PCR sealing enabled with PCRs %v", pcrs)
+		} else {
+			log.Printf("tpm: PCR sealing disabled")
+		}
+
+		signer, err := tpm.New(*device, opts...)
 		if err != nil {
 			panic(err)
 		}
@@ -147,35 +173,19 @@ func newServer() *server {
 	}
 	s.resident = resident
 
-	pins, err := pinstore.Open(*pinStorePath)
-	if err != nil {
-		panic(err)
-	}
-	s.pins = pins
-
 	ka, err := pinprotocol.NewKeyAgreement()
 	if err != nil {
 		panic(err)
 	}
 	s.keyAgreement = ka
 
-	uvcfg, err := uvconfig.Open(*uvConfigPath)
-	if err != nil {
-		panic(err)
-	}
-	s.uvcfg = uvcfg
-
-	s.uvVerifier = pinverifier.New(s.pe, s.pins)
+	s.uvVerifier = pamverifier.New(*promptPath)
 
 	return &s
 }
 
 func (s *server) run() {
 	ctx := context.Background()
-
-	if pinentry.FindPinentryGUIPath() == "" {
-		log.Printf("warning: no gui pinentry binary detected in PATH. tpm-fido may not work correctly without a gui based pinentry")
-	}
 
 	token, err := fidohid.New(ctx, "tpm-fido")
 	if err != nil {
@@ -192,7 +202,7 @@ func (s *server) run() {
 	}()
 
 	if !*noTray {
-		go launchTray(ctlSocketReady)
+		go launchTraySupervisor(ctlSocketReady)
 	}
 
 	for evt := range token.Events() {
@@ -289,44 +299,24 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 	var userPresent uint8
 
 	if req.Authenticate.Ctrl == fidoauth.CtrlEnforeUserPresenceAndSign {
-
-		pinResultCh, err := s.pe.ConfirmPresence(parentCtx, "FIDO Confirm Auth", req.Authenticate.ChallengeParam, req.Authenticate.ApplicationParam)
-
-		if err != nil {
-			log.Printf("pinentry err: %s", err)
-			token.WriteResponse(parentCtx, evt, nil, statuscode.ConditionsNotSatisfied)
-
-			return
-		}
-
-		childCtx, cancel := context.WithTimeout(parentCtx, 750*time.Millisecond)
-		defer cancel()
-
-		select {
-		case result := <-pinResultCh:
-			if result.OK {
-				userPresent = 0x01
-			} else {
-				if result.Error != nil {
-					log.Printf("Got pinentry result err: %s", result.Error)
-				}
-
-				// Got user cancelation, we want to propagate that so the browser gives up.
-				// This isn't normally supported by a key so there's no status code for this.
-				// WrongData seems like the least incorrect status code ¯\_(ツ)_/¯
+		site := sitesignatures.FromAppParam(req.Authenticate.ApplicationParam)
+		outcome, err := s.uvVerifier.Verify(parentCtx, site, "", "authenticate")
+		if err != nil || outcome != uvmethod.Verified {
+			if outcome == uvmethod.Rejected {
+				// User explicitly canceled
 				err := token.WriteResponse(parentCtx, evt, nil, statuscode.WrongData)
 				if err != nil {
 					log.Printf("Write WrongData resp err: %s", err)
 				}
 				return
 			}
-		case <-childCtx.Done():
 			err := token.WriteResponse(parentCtx, evt, nil, statuscode.ConditionsNotSatisfied)
 			if err != nil {
 				log.Printf("Write swConditionsNotSatisfied resp err: %s", err)
 			}
 			return
 		}
+		userPresent = 0x01
 	}
 
 	signCounter := s.signer.Counter()
@@ -358,45 +348,27 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 }
 
 func (s *server) handleRegister(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
-	ctx, cancel := context.WithTimeout(parentCtx, 750*time.Millisecond)
-	defer cancel()
 	req := evt.Req
+	site := sitesignatures.FromAppParam(req.Register.ApplicationParam)
 
-	pinResultCh, err := s.pe.ConfirmPresence(parentCtx, "FIDO Confirm Register", req.Register.ChallengeParam, req.Register.ApplicationParam)
-
-	if err != nil {
-		log.Printf("pinentry err: %s", err)
-		token.WriteResponse(ctx, evt, nil, statuscode.ConditionsNotSatisfied)
-
+	outcome, err := s.uvVerifier.Verify(parentCtx, site, "", "register")
+	if err != nil || outcome != uvmethod.Verified {
+		if outcome == uvmethod.Rejected {
+			// Got user cancelation, we want to propagate that so the browser gives up.
+			err := token.WriteResponse(parentCtx, evt, nil, statuscode.WrongData)
+			if err != nil {
+				log.Printf("Write WrongData resp err: %s", err)
+			}
+			return
+		}
+		err := token.WriteResponse(parentCtx, evt, nil, statuscode.ConditionsNotSatisfied)
+		if err != nil {
+			log.Printf("Write swConditionsNotSatisfied resp err: %s", err)
+		}
 		return
 	}
 
-	select {
-	case result := <-pinResultCh:
-		if !result.OK {
-			if result.Error != nil {
-				log.Printf("Got pinentry result err: %s", result.Error)
-			}
-
-			// Got user cancelation, we want to propagate that so the browser gives up.
-			// This isn't normally supported by a key so there's no status code for this.
-			// WrongData seems like the least incorrect status code ¯\_(ツ)_/¯
-			err := token.WriteResponse(ctx, evt, nil, statuscode.WrongData)
-			if err != nil {
-				log.Printf("Write WrongData resp err: %s", err)
-				return
-			}
-			return
-		}
-
-		s.registerSite(parentCtx, token, evt)
-	case <-ctx.Done():
-		err := token.WriteResponse(ctx, evt, nil, statuscode.ConditionsNotSatisfied)
-		if err != nil {
-			log.Printf("Write swConditionsNotSatisfied resp err: %s", err)
-			return
-		}
-	}
+	s.registerSite(parentCtx, token, evt)
 }
 
 func (s *server) registerSite(ctx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
@@ -447,31 +419,6 @@ func (s *server) registerSite(ctx context.Context, token *fidohid.SoftToken, evt
 	}
 }
 
-// launchTray starts the tpm-fido-tray companion UI once the control socket
-// is ready to accept connections (so its first PINStatus call doesn't race
-// the daemon's own startup), if it's found on PATH. Not finding it is not
-// an error -- the daemon is fully functional without the tray UI, which is
-// an optional convenience for managing the PIN/credentials, and most
-// installs of tpm-fido won't have built it.
-func launchTray(ctlSocketReady <-chan struct{}) {
-	trayPath, err := exec.LookPath("tpm-fido-tray")
-	if err != nil {
-		log.Printf("tpm-fido-tray not found on PATH, skipping companion UI (use -no-tray to silence this)")
-		return
-	}
-
-	<-ctlSocketReady
-
-	cmd := exec.Command(trayPath)
-	if err := cmd.Start(); err != nil {
-		log.Printf("failed to launch tpm-fido-tray: %s", err)
-		return
-	}
-
-	// Reap the child when it exits so it doesn't linger as a zombie; the
-	// daemon doesn't care about or depend on the tray's exit status.
-	go cmd.Wait()
-}
 
 func mustRand(size int) []byte {
 	b := make([]byte, size)

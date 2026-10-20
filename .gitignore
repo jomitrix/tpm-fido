@@ -1,4 +1,10 @@
 /tpm-fido
 /tpm-fido-tray
+/tpm-fido-manager
+/tpm-fido-prompt
+/tpm-fido-pam-helper
 /cmd/tpm-fido-tray/tpm-fido-tray
 tpm-fido-spike
+*.pkg.tar.*
+/pkg/
+/src/

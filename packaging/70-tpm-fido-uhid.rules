@@ -1,0 +1,2 @@
+# Allow users in 'uhid' group to access /dev/uhid for software HID passkey emulation
+KERNEL=="uhid", SUBSYSTEM=="misc", GROUP="uhid", MODE="0660"

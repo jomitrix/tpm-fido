@@ -331,40 +331,24 @@ func hasVersion(vs []string, want string) bool {
 	return false
 }
 
-func TestEncodeGetInfoInternalUVGating(t *testing.T) {
-	// Hello mode requires BOTH the toggle on AND a PIN set.
-	cases := []struct {
-		name              string
-		pinSet, internal  bool
-		wantUV, want2_1   bool
-	}{
-		{"no-pin-toggle-off", false, false, false, false},
-		{"no-pin-toggle-on", false, true, false, false},
-		{"pin-toggle-off", true, false, false, false},
-		{"pin-toggle-on", true, true, true, true},
+func TestEncodeGetInfo(t *testing.T) {
+	body, err := EncodeGetInfoResponse()
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			body, err := EncodeGetInfoResponse(tc.pinSet, tc.internal)
-			if err != nil {
-				t.Fatal(err)
-			}
-			opts, versions := decodeGetInfo(t, body)
+	opts, versions := decodeGetInfo(t, body)
 
-			if got := opts["uv"]; got != tc.wantUV {
-				t.Errorf("uv=%t, want %t", got, tc.wantUV)
-			}
-			if got := opts["pinUvAuthToken"]; got != tc.wantUV {
-				t.Errorf("pinUvAuthToken=%t, want %t", got, tc.wantUV)
-			}
-			if got := hasVersion(versions, "FIDO_2_1"); got != tc.want2_1 {
-				t.Errorf("FIDO_2_1 advertised=%t, want %t", got, tc.want2_1)
-			}
-			// clientPin option always tracks the PIN-set state regardless.
-			if got := opts["clientPin"]; got != tc.pinSet {
-				t.Errorf("clientPin=%t, want %t", got, tc.pinSet)
-			}
-		})
+	if got := opts["uv"]; got != true {
+		t.Errorf("uv=%t, want true", got)
+	}
+	if got := opts["pinUvAuthToken"]; got != true {
+		t.Errorf("pinUvAuthToken=%t, want true", got)
+	}
+	if got := hasVersion(versions, "FIDO_2_1"); got != true {
+		t.Errorf("FIDO_2_1 advertised=%t, want true", got)
+	}
+	if got := opts["clientPin"]; got != false {
+		t.Errorf("clientPin=%t, want false", got)
 	}
 }
 

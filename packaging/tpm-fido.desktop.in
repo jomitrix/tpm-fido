@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=tpm-fido
-Comment=TPM-backed FIDO2/U2F authenticator daemon
-Exec=@BINDIR@/tpm-fido -backend tpm
+Comment=TPM-backed FIDO2/WebAuthn authenticator daemon
+Exec=systemctl --user start tpm-fido.service
 Icon=@ICON@
 Terminal=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel

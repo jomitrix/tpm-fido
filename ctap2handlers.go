@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"log"
-	"time"
 
 	"github.com/psanford/tpm-fido/attestation"
 	"github.com/psanford/tpm-fido/ctap2"
@@ -31,9 +30,8 @@ func (s *server) handleCbor(parentCtx context.Context, token *fidohid.SoftToken,
 
 	switch cmd {
 	case ctap2.CmdGetInfo:
-		internalUV := s.uvcfg.InternalUV()
-		log.Printf("got CTAP2 authenticatorGetInfo (internalUV=%t)", internalUV)
-		resp, err := ctap2.EncodeGetInfoResponse(s.pins.IsSet(), internalUV)
+		log.Printf("got CTAP2 authenticatorGetInfo")
+		resp, err := ctap2.EncodeGetInfoResponse()
 		if err != nil {
 			log.Printf("encode getInfo response err: %s", err)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
@@ -128,40 +126,24 @@ func (s *server) handleMakeCredential(parentCtx context.Context, token *fidohid.
 		return
 	}
 
-	var challengeParam, applicationParam [32]byte
-	copy(challengeParam[:], req.ClientDataHash)
 	rpIDHash := sha256.Sum256([]byte(req.RP.ID))
-	copy(applicationParam[:], rpIDHash[:])
 
-	pinResultCh, err := s.pe.ConfirmPresence(parentCtx, "FIDO Confirm Register", challengeParam, applicationParam)
-	if err != nil {
-		log.Printf("pinentry err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
-	defer cancel()
-
-	select {
-	case result := <-pinResultCh:
-		if !result.OK {
-			if result.Error != nil {
-				log.Printf("got pinentry result err: %s", result.Error)
+	if !userVerified {
+		user := req.User.Name
+		if user == "" {
+			user = req.User.DisplayName
+		}
+		outcome, err := s.uvVerifier.Verify(parentCtx, req.RP.ID, user, "register")
+		if err != nil || outcome != uvmethod.Verified {
+			if outcome == uvmethod.Rejected {
+				log.Printf("MakeCredential UV rejected by user site=%s", req.RP.ID)
+			} else {
+				log.Printf("MakeCredential UV error site=%s: %v", req.RP.ID, err)
 			}
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
 			return
 		}
-		log.Printf("pinentry confirmed for MakeCredential site=%s", req.RP.ID)
-	case <-ctx.Done():
-		if parentCtx.Err() != nil {
-			log.Printf("MakeCredential canceled by platform for site=%s", req.RP.ID)
-			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusKeepAliveCancel)
-			return
-		}
-		log.Printf("pinentry timed out (30s) for MakeCredential site=%s", req.RP.ID)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
+		userVerified = true
 	}
 
 	keyHandle, x, y, err := s.signer.RegisterKey(rpIDHash[:])
@@ -183,9 +165,8 @@ func (s *server) handleMakeCredential(parentCtx context.Context, token *fidohid.
 	pubKeyX := x.Bytes()
 	pubKeyY := y.Bytes()
 
-	// userVerified reflects an actual pinUvAuthParam check above, not just
-	// the pinentry presence tap -- UV must never be reported true unless a
-	// PIN was genuinely verified for this request.
+	// userVerified reflects an actual pinUvAuthParam check above or the
+	// built-in PAM user verification dialog.
 	authData, err := ctap2.BuildAuthData(req.RP.ID, true, userVerified, s.signer.Counter(), credID, pubKeyX, pubKeyY)
 	if err != nil {
 		log.Printf("BuildAuthData err: %s", err)
@@ -285,13 +266,7 @@ func (s *server) handleGetAssertion(parentCtx context.Context, token *fidohid.So
 	}
 
 	// userVerified reflects an actual pinUvAuthParam check against the
-	// current pinToken, never the pinentry presence tap below -- a tap
-	// only proves presence, not that the user's PIN was verified. Verify
-	// pinUvAuthParam whenever the platform sent one, regardless of
-	// options.uv -- real platforms signal UV intent by sending the param,
-	// not necessarily by also setting options.uv (see the longer comment
-	// in handleMakeCredential for why gating on options.uv alone is
-	// wrong).
+	// current pinToken or the PAM verification dialog below.
 	userVerified := false
 	if len(req.PinUvAuthParam) > 0 {
 		if req.PinUvAuthProtocol != 1 {
@@ -311,41 +286,18 @@ func (s *server) handleGetAssertion(parentCtx context.Context, token *fidohid.So
 		return
 	}
 
-	if req.UserPresence {
-		var challengeParam, applicationParam [32]byte
-		copy(challengeParam[:], req.ClientDataHash)
-		copy(applicationParam[:], rpIDHash[:])
-
-		pinResultCh, err := s.pe.ConfirmPresence(parentCtx, "FIDO Confirm Auth", challengeParam, applicationParam)
-		if err != nil {
-			log.Printf("pinentry err: %s", err)
-			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
-		defer cancel()
-
-		select {
-		case result := <-pinResultCh:
-			if !result.OK {
-				if result.Error != nil {
-					log.Printf("got pinentry result err: %s", result.Error)
-				}
-				token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-				return
-			}
-		case <-ctx.Done():
-			if parentCtx.Err() != nil {
-				log.Printf("GetAssertion canceled by platform for site=%s", req.RPID)
-				token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusKeepAliveCancel)
-				return
+	if req.UserPresence && !userVerified {
+		outcome, err := s.uvVerifier.Verify(parentCtx, req.RPID, userName, "authenticate")
+		if err != nil || outcome != uvmethod.Verified {
+			if outcome == uvmethod.Rejected {
+				log.Printf("GetAssertion UV rejected by user site=%s", req.RPID)
+			} else {
+				log.Printf("GetAssertion UV error site=%s: %v", req.RPID, err)
 			}
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
 			return
 		}
-	} else {
-		log.Printf("silent GetAssertion (up=false) for site=%s, skipping pinentry", req.RPID)
+		userVerified = true
 	}
 
 	// Resident credentials get their own persisted, monotonic per-credential
@@ -525,10 +477,8 @@ func (s *server) handleCredentialManagement(parentCtx context.Context, token *fi
 		}
 
 		// pinUvAuthParam verification above already proves possession of
-		// a valid pinUvAuthToken obtained via a PIN the user entered, so
-		// no separate pinentry presence prompt is needed here -- the PIN
-		// entry itself was the authorization step, same as how deleting a
-		// resident credential works on real security keys.
+		// a valid pinUvAuthToken obtained via PAM verification, so
+		// no separate user prompt is needed here.
 		if err := s.resident.Delete(rpID, req.CredID); err != nil {
 			log.Printf("delete credential err: %s", err)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusInvalidCredential)
@@ -595,7 +545,7 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 
 	switch req.SubCommand {
 	case ctap2.ClientPINSubGetPINRetries:
-		resp, err := ctap2.EncodeClientPINRetriesResponse(s.pins.RetriesLeft())
+		resp, err := ctap2.EncodeClientPINRetriesResponse(8)
 		if err != nil {
 			log.Printf("EncodeClientPINRetriesResponse err: %s", err)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
@@ -613,17 +563,12 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 		}
 		token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
 
-	case ctap2.ClientPINSubSetPIN:
-		s.handleSetPIN(parentCtx, token, evt, req)
-
-	case ctap2.ClientPINSubChangePIN:
-		s.handleChangePIN(parentCtx, token, evt, req)
-
-	case ctap2.ClientPINSubGetPINToken:
-		s.handleGetPINToken(parentCtx, token, evt, req)
+	case ctap2.ClientPINSubSetPIN, ctap2.ClientPINSubChangePIN, ctap2.ClientPINSubGetPINToken:
+		// Client PIN is disabled in favor of PAM system password authentication.
+		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusUnsupportedOption)
 
 	case ctap2.ClientPINSubGetUVRetries:
-		resp, err := ctap2.EncodeClientPINUVRetriesResponse(s.pins.RetriesLeft())
+		resp, err := ctap2.EncodeClientPINUVRetriesResponse(8)
 		if err != nil {
 			log.Printf("EncodeClientPINUVRetriesResponse err: %s", err)
 			token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
@@ -640,174 +585,13 @@ func (s *server) handleClientPIN(parentCtx context.Context, token *fidohid.SoftT
 	}
 }
 
-func (s *server) handleSetPIN(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent, req *ctap2.ClientPINRequest) {
-	if s.pins.IsSet() {
-		// setPIN is only valid when no PIN exists yet; changePIN is used
-		// after that. Real authenticators reject this as PIN_AUTH_INVALID.
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	_, newPin, ok := s.decryptNewPIN(token, parentCtx, evt, req)
-	if !ok {
-		return
-	}
-
-	if err := s.pins.SetPIN(pinprotocol.HashPIN(newPin)); err != nil {
-		log.Printf("SetPIN err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	log.Printf("PIN set")
-	token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusSuccess)
-}
-
-func (s *server) handleChangePIN(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent, req *ctap2.ClientPINRequest) {
-	if !s.pins.IsSet() {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	sharedSecret, err := s.keyAgreement.SharedSecret(req.PeerKeyX, req.PeerKeyY)
-	if err != nil {
-		log.Printf("SharedSecret err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	if len(req.PinHashEnc) == 0 || len(req.NewPinEnc) == 0 || len(req.PinUvAuthParam) == 0 {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	// pinUvAuthParam for changePIN is computed over newPinEnc||pinHashEnc.
-	msg := append(append([]byte{}, req.NewPinEnc...), req.PinHashEnc...)
-	if !pinprotocol.VerifyAuthenticate(sharedSecret, msg, req.PinUvAuthParam) {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	pinHash, err := pinprotocol.Decrypt(sharedSecret, req.PinHashEnc)
-	if err != nil {
-		log.Printf("decrypt pinHashEnc err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	match, err := s.pins.Verify(pinHash)
-	if err != nil {
-		log.Printf("PIN locked out: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-	if !match {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	newPinPadded, err := pinprotocol.Decrypt(sharedSecret, req.NewPinEnc)
-	if err != nil {
-		log.Printf("decrypt newPinEnc err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-	newPin := trimPINPadding(newPinPadded)
-
-	if err := s.pins.SetPIN(pinprotocol.HashPIN(newPin)); err != nil {
-		log.Printf("SetPIN err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	// Any previously issued token is invalidated by a PIN change.
-	s.setPinToken(nil)
-
-	log.Printf("PIN changed")
-	token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusSuccess)
-}
-
-func (s *server) handleGetPINToken(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent, req *ctap2.ClientPINRequest) {
-	if !s.pins.IsSet() {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	sharedSecret, err := s.keyAgreement.SharedSecret(req.PeerKeyX, req.PeerKeyY)
-	if err != nil {
-		log.Printf("SharedSecret err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	if len(req.PinHashEnc) == 0 {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	pinHash, err := pinprotocol.Decrypt(sharedSecret, req.PinHashEnc)
-	if err != nil {
-		log.Printf("decrypt pinHashEnc err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	match, err := s.pins.Verify(pinHash)
-	if err != nil {
-		log.Printf("PIN locked out: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-	if !match {
-		log.Printf("PIN mismatch, %d retries left", s.pins.RetriesLeft())
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return
-	}
-
-	pinToken := make([]byte, 32)
-	if _, err := rand.Read(pinToken); err != nil {
-		log.Printf("generate pinToken err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-	s.setPinToken(pinToken)
-
-	encryptedToken, err := pinprotocol.Encrypt(sharedSecret, pinToken)
-	if err != nil {
-		log.Printf("encrypt pinToken err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	resp, err := ctap2.EncodeClientPINTokenResponse(encryptedToken)
-	if err != nil {
-		log.Printf("EncodeClientPINTokenResponse err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return
-	}
-
-	log.Printf("issued pinUvAuthToken")
-	token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
-}
-
 // handleGetUvToken implements CTAP 2.1
 // getPinUvAuthTokenUsingUvWithPermissions (subcommand 0x06): the
 // Windows-Hello-style path. Instead of the platform sending us a
 // browser-collected pinHashEnc, WE perform built-in user verification on our
-// own side (via s.uvVerifier -- a system PIN dialog today, potentially
-// biometrics later) and, on success, mint a UV-backed pinUvAuthToken. The
-// browser never shows a PIN box.
-//
-// This is only reachable when getInfo advertised uv:true, which is gated on
-// the internal-UV toggle plus a PIN being set; we re-check the toggle here as
-// defense-in-depth in case it was flipped off between getInfo and this call.
+// own side via Linux PAM and, on success, mint a UV-backed pinUvAuthToken.
+// The browser never shows a PIN box.
 func (s *server) handleGetUvToken(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent, req *ctap2.ClientPINRequest) {
-	if !s.uvcfg.InternalUV() || !s.pins.IsSet() {
-		log.Printf("getUvToken refused: internal UV not enabled")
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusUnsupportedOption)
-		return
-	}
-
 	sharedSecret, err := s.keyAgreement.SharedSecret(req.PeerKeyX, req.PeerKeyY)
 	if err != nil {
 		log.Printf("SharedSecret err: %s", err)
@@ -815,9 +599,25 @@ func (s *server) handleGetUvToken(parentCtx context.Context, token *fidohid.Soft
 		return
 	}
 
-	// Built-in user verification (our own system prompt). This blocks on the
-	// user; parentCtx cancellation (CTAPHID_CANCEL) aborts it.
-	outcome, err := s.uvVerifier.Verify(parentCtx, req.RpID)
+	mode := "authenticate"
+	if req.Permissions&0x01 != 0 {
+		mode = "register"
+	} else if req.Permissions&0x02 != 0 {
+		mode = "authenticate"
+	} else if req.Permissions&0x04 != 0 {
+		mode = "manage"
+	}
+
+	user := ""
+	if mode == "authenticate" && req.RpID != "" {
+		creds := s.resident.ByRPID(req.RpID)
+		if len(creds) == 1 {
+			user = creds[0].UserName
+		}
+	}
+
+	// Built-in user verification via PAM modal.
+	outcome, err := s.uvVerifier.Verify(parentCtx, req.RpID, user, mode)
 	if err != nil {
 		log.Printf("getUvToken: uv method %q error: %s", s.uvVerifier.Name(), err)
 		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
@@ -863,55 +663,10 @@ func (s *server) handleGetUvToken(parentCtx context.Context, token *fidohid.Soft
 		return
 	}
 
-	log.Printf("issued UV-backed pinUvAuthToken (no browser PIN box)")
+	log.Printf("issued UV-backed pinUvAuthToken (site=%s user=%s mode=%s)", req.RpID, user, mode)
 	token.WriteCborResponse(parentCtx, evt, resp, ctap2.StatusSuccess)
 }
 
-// decryptNewPIN validates and decrypts the newPinEnc field for setPIN,
-// verifying pinUvAuthParam (computed over newPinEnc alone, unlike
-// changePIN which includes pinHashEnc too) and stripping the zero padding
-// PIN plaintexts are padded to a 64-byte boundary with.
-func (s *server) decryptNewPIN(token *fidohid.SoftToken, parentCtx context.Context, evt fidohid.AuthEvent, req *ctap2.ClientPINRequest) ([]byte, string, bool) {
-	sharedSecret, err := s.keyAgreement.SharedSecret(req.PeerKeyX, req.PeerKeyY)
-	if err != nil {
-		log.Printf("SharedSecret err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return nil, "", false
-	}
-
-	if len(req.NewPinEnc) == 0 || len(req.PinUvAuthParam) == 0 {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return nil, "", false
-	}
-
-	if !pinprotocol.VerifyAuthenticate(sharedSecret, req.NewPinEnc, req.PinUvAuthParam) {
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOperationDenied)
-		return nil, "", false
-	}
-
-	newPinPadded, err := pinprotocol.Decrypt(sharedSecret, req.NewPinEnc)
-	if err != nil {
-		log.Printf("decrypt newPinEnc err: %s", err)
-		token.WriteCborResponse(parentCtx, evt, nil, ctap2.StatusOther)
-		return nil, "", false
-	}
-
-	return sharedSecret, trimPINPadding(newPinPadded), true
-}
-
-// trimPINPadding strips the trailing zero-byte padding CTAP2 platforms pad
-// newPinEnc plaintext to (64 bytes for Protocol One).
-func trimPINPadding(padded []byte) string {
-	i := len(padded)
-	for i > 0 && padded[i-1] == 0 {
-		i--
-	}
-	return string(padded[:i])
-}
-
-// verifyPinToken checks pinUvAuthParam against the current pinUvAuthToken
-// for a privileged (token-gated) request, using constant-time comparison
-// on the derived HMAC to avoid a timing oracle.
 func (s *server) verifyPinToken(message, pinUvAuthParam []byte) bool {
 	tok := s.getPinToken()
 	if len(tok) == 0 || len(pinUvAuthParam) == 0 {

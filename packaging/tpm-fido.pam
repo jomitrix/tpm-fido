@@ -1,0 +1,13 @@
+#%PAM-1.0
+# PAM configuration for tpm-fido passkey user verification
+# Provides isolated user authentication for hardware-bound passkeys
+# without exposing login capabilities or invoking session managers.
+
+-auth       [success=2 default=ignore]  pam_systemd_home.so
+auth        [success=1 default=bad]     pam_unix.so try_first_pass nullok
+auth        required                    pam_deny.so
+auth        optional                    pam_permit.so
+
+-account    [success=1 default=ignore]  pam_systemd_home.so
+account     required                    pam_unix.so
+account     optional                    pam_permit.so

@@ -1,0 +1,30 @@
+post_install() {
+    # Reload udev rules so /dev/uhid permissions take effect immediately
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules && udevadm trigger /dev/uhid 2>/dev/null || true
+    fi
+
+    echo ":: TPM-FIDO Installation Notes:"
+    echo "   1. Ensure your user belongs to the 'tss' and 'uhid' groups:"
+    echo "      sudo usermod -aG tss,uhid \$USER"
+    echo "   2. Ensure the kernel module 'uhid' is loaded:"
+    echo "      sudo modprobe uhid"
+    echo "      (Add 'uhid' to /etc/modules-load.d/uhid.conf for boot persistence)"
+    echo "   3. Systemd User Service:"
+    echo "      tpm-fido automatically configures and enables its systemd user service"
+    echo "      on first run. You can also manually enable it right now with:"
+    echo "      systemctl --user enable --now tpm-fido.service"
+}
+
+post_upgrade() {
+    post_install
+    echo ":: Restarting tpm-fido user service if currently running..."
+    systemctl --user daemon-reload 2>/dev/null || true
+}
+
+post_remove() {
+    echo ":: Reloading udev rules..."
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+    fi
+}

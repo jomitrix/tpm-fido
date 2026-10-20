@@ -1,0 +1,38 @@
+[Unit]
+Description=TPM 2.0 FIDO2/WebAuthn Authenticator Daemon (Hardened)
+After=graphical-session.target default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tpm-fido
+Restart=always
+RestartSec=2
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=GDK_BACKEND=wayland,x11
+Environment=TMPDIR=%t
+
+# --- Sandboxing & Restrizioni di Sicurezza ---
+# Isola /tmp e /var/tmp in un namespace privato
+PrivateTmp=true
+
+# Protegge il filesystem di sistema (/usr, /boot, /etc) e l'intera $HOME in sola lettura
+ProtectSystem=full
+ProtectHome=read-only
+
+# Rende scrivibili solo il runtime directory (socket IPC/D-Bus/Wayland) e la cartella credenziali
+ReadWritePaths=%t %h/.config/tpm-fido
+
+# Limita l'accesso hardware esclusivamente al TPM e a UHID
+DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw
+DeviceAllow=/dev/uhid rw
+
+# Protegge i parametri del kernel e i cgroups
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+# Restringe i socket a quelli locali offline e netlink per PAM audit (nessun accesso a internet/rete esterna)
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=graphical-session.target default.target

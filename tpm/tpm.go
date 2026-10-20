@@ -34,15 +34,32 @@ type TPM struct {
 	// -- a tie or decrease is what RPs use to flag a cloned/replayed
 	// authenticator.
 	lastCounter uint32
+
+	// pcrs holds the list of PCR indices to seal passkey signing keys to
+	// (e.g. [0, 2, 7] for firmware, option ROMs, and Secure Boot state).
+	// An empty slice disables PCR sealing.
+	pcrs []int
+}
+
+type Option func(*TPM)
+
+// WithPCRs configures the PCR registers to seal newly created passkeys to.
+func WithPCRs(pcrs []int) Option {
+	return func(t *TPM) {
+		t.pcrs = append([]int(nil), pcrs...)
+	}
 }
 
 func (t *TPM) open() (io.ReadWriteCloser, error) {
 	return tpm2.OpenTPM(t.devicePath)
 }
 
-func New(devicePath string) (*TPM, error) {
+func New(devicePath string, opts ...Option) (*TPM, error) {
 	t := &TPM{
 		devicePath: devicePath,
+	}
+	for _, opt := range opts {
+		opt(t)
 	}
 
 	tpm, err := t.open()
@@ -104,7 +121,46 @@ func (t *TPM) Counter() uint32 {
 	}
 }
 
+func (t *TPM) computePCRPolicy(tpm io.ReadWriter, pcrs []int) ([]byte, error) {
+	if len(pcrs) == 0 {
+		return nil, nil
+	}
+
+	sel := tpm2.PCRSelection{
+		Hash: tpm2.AlgSHA256,
+		PCRs: pcrs,
+	}
+
+	trialSess, _, err := tpm2.StartAuthSession(
+		tpm,
+		tpm2.HandleNull,
+		tpm2.HandleNull,
+		make([]byte, 16),
+		nil,
+		tpm2.SessionTrial,
+		tpm2.AlgNull,
+		tpm2.AlgSHA256,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("StartAuthSession(trial) failed: %w", err)
+	}
+	defer tpm2.FlushContext(tpm, trialSess)
+
+	if err := tpm2.PolicyPCR(tpm, trialSess, nil, sel); err != nil {
+		return nil, fmt.Errorf("PolicyPCR(trial) failed: %w", err)
+	}
+
+	policyDigest, err := tpm2.PolicyGetDigest(tpm, trialSess)
+	if err != nil {
+		return nil, fmt.Errorf("PolicyGetDigest failed: %w", err)
+	}
+
+	return policyDigest, nil
+}
+
 // Register a new key with the TPM for the given applicationParam.
+// If PCR sealing is configured, the key is cryptographically sealed to
+// the selected PCR registers, ensuring it cannot be used if system state changes.
 // RegisterKey returns the KeyHandle or an error.
 func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, error) {
 	t.mu.Lock()
@@ -124,10 +180,8 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 		Type:    tpm2.AlgECC,
 		NameAlg: tpm2.AlgSHA256,
 		Attributes: tpm2.FlagFixedTPM | tpm2.FlagFixedParent |
-			tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth |
-			tpm2.FlagSign,
+			tpm2.FlagSensitiveDataOrigin | tpm2.FlagSign,
 		ECCParameters: &tpm2.ECCParams{
-
 			Sign: &tpm2.SigScheme{
 				Alg:  tpm2.AlgECDSA,
 				Hash: tpm2.AlgSHA256,
@@ -138,6 +192,21 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 				YRaw: make([]byte, 32),
 			},
 		},
+	}
+
+	policyDigest, err := t.computePCRPolicy(tpm, t.pcrs)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("compute PCR policy err: %w", err)
+	}
+
+	if len(policyDigest) > 0 {
+		// When PCR sealing is active, bind the key directly to the PCR policy digest.
+		// Omitting FlagUserWithAuth ensures the key CANNOT be signed with a simple
+		// password session, enforcing that the TPM verify the PCR registers in hardware.
+		childTmpl.AuthPolicy = policyDigest
+	} else {
+		// Legacy / unsealed mode: permit standard user authorization
+		childTmpl.Attributes |= tpm2.FlagUserWithAuth
 	}
 
 	parentHandle, _, err := tpm2.CreatePrimary(tpm, tpm2.HandleOwner, tpm2.PCRSelection{}, "", "", primaryTmpl)
@@ -158,6 +227,13 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 	enc.Encode(private)
 	enc.Encode(public)
 	enc.Encode(randSeed)
+	if len(t.pcrs) > 0 {
+		pcrBytes := make([]byte, len(t.pcrs))
+		for i, p := range t.pcrs {
+			pcrBytes[i] = byte(p)
+		}
+		enc.Encode(pcrBytes)
+	}
 
 	keyHandle, _, err := tpm2.Load(tpm, parentHandle, "", public, private)
 	if err != nil {
@@ -206,8 +282,15 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 		return nil, invalidHandleErr
 	}
 
-	_, err = dec.Decode()
-	if err != io.EOF {
+	// 4th chunk optionally stores the PCR list used when registering this credential
+	var pcrBytes []byte
+	chunk, err := dec.Decode()
+	if err == nil {
+		pcrBytes = chunk
+		if _, err := dec.Decode(); err != io.EOF {
+			return nil, invalidHandleErr
+		}
+	} else if err != io.EOF {
 		return nil, invalidHandleErr
 	}
 
@@ -227,14 +310,65 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 
 	defer tpm2.FlushContext(tpm, key)
 
+	pubObj, _, _, err := tpm2.ReadPublic(tpm, key)
+	if err != nil {
+		return nil, fmt.Errorf("ReadPublic err: %w", err)
+	}
+
 	scheme := &tpm2.SigScheme{
 		Alg:  tpm2.AlgECDSA,
 		Hash: tpm2.AlgSHA256,
 	}
 
-	sig, err := tpm2.Sign(tpm, key, "", digest[:], nil, scheme)
-	if err != nil {
-		return nil, fmt.Errorf("sign err: %w", err)
+	var sig *tpm2.Signature
+	if len(pubObj.AuthPolicy) > 0 {
+		// Key was sealed with a PCR policy. Start a real SessionPolicy session
+		// and satisfy PolicyPCR against the system's live PCR registers.
+		var pcrs []int
+		if len(pcrBytes) > 0 {
+			for _, b := range pcrBytes {
+				pcrs = append(pcrs, int(b))
+			}
+		} else if len(t.pcrs) > 0 {
+			pcrs = t.pcrs
+		} else {
+			pcrs = []int{0, 2, 7}
+		}
+
+		sel := tpm2.PCRSelection{
+			Hash: tpm2.AlgSHA256,
+			PCRs: pcrs,
+		}
+
+		policySess, _, err := tpm2.StartAuthSession(
+			tpm,
+			tpm2.HandleNull,
+			tpm2.HandleNull,
+			make([]byte, 16),
+			nil,
+			tpm2.SessionPolicy,
+			tpm2.AlgNull,
+			tpm2.AlgSHA256,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("StartAuthSession(policy) failed: %w", err)
+		}
+		defer tpm2.FlushContext(tpm, policySess)
+
+		if err := tpm2.PolicyPCR(tpm, policySess, nil, sel); err != nil {
+			return nil, fmt.Errorf("PolicyPCR failed: %w", err)
+		}
+
+		sig, err = tpm2.SignWithSession(tpm, policySess, key, "", digest[:], nil, scheme)
+		if err != nil {
+			return nil, fmt.Errorf("sign with PCR policy session err (PCR state mismatch/tampered): %w", err)
+		}
+	} else {
+		// Legacy / unsealed key: authenticate with standard password session
+		sig, err = tpm2.Sign(tpm, key, "", digest[:], nil, scheme)
+		if err != nil {
+			return nil, fmt.Errorf("sign err: %w", err)
+		}
 	}
 
 	var b cryptobyte.Builder
